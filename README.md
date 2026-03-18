@@ -163,6 +163,14 @@ LLaDA-o/
 - [`modeling/`](./modeling): model definitions for LLaDA, LLaDA-o, SigLIP-based vision components, and the autoencoder.
 - [`train/`](./train): distributed training utilities and the main pretraining script.
 
+## Acknowledgements
+
+The code is largely based on [BAGEL](https://github.com/ByteDance-Seed/Bagel). We thank the authors for their great work.
+
+## Contact
+
+If you have any questions, please feel free to contact us at zebin@ruc.edu.cn.
+
 ## Citation
 
 If you find this repository useful in your research, please consider citing:

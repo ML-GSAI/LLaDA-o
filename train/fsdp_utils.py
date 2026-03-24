@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import json
 import os
 
 import torch
@@ -87,6 +88,99 @@ def fsdp_wrapper(original_model, fsdp_config, ignored_modules=[]):
 
 
 class FSDPCheckpoint:
+    FIXED_POS_EMBED_KEYS = (
+        "latent_pos_embed.pos_embed",
+        "vit_pos_embed.pos_embed",
+    )
+
+    @staticmethod
+    def _find_safetensors_artifact(checkpoint_dir, stem):
+        single_file_path = os.path.join(checkpoint_dir, f"{stem}.safetensors")
+        index_file_path = os.path.join(checkpoint_dir, f"{stem}.safetensors.index.json")
+
+        if os.path.exists(single_file_path):
+            return single_file_path
+        if os.path.exists(index_file_path):
+            return index_file_path
+        return None
+
+    @staticmethod
+    def _iter_shard_paths(index_file_path):
+        with open(index_file_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or len(weight_map) == 0:
+            raise ValueError(f"Invalid sharded safetensors index file: {index_file_path}")
+
+        shard_names = list(dict.fromkeys(weight_map.values()))
+        index_dir = os.path.dirname(index_file_path)
+        for shard_name in shard_names:
+            shard_path = os.path.join(index_dir, shard_name)
+            if not os.path.exists(shard_path):
+                raise FileNotFoundError(
+                    f"Shard referenced by index file does not exist: {shard_path}"
+                )
+            yield shard_name, shard_path
+
+    @staticmethod
+    def _remove_fixed_pos_embeds(state_dict, logger, state_name):
+        removed_keys = []
+        for key in FSDPCheckpoint.FIXED_POS_EMBED_KEYS:
+            if key in state_dict:
+                state_dict.pop(key)
+                removed_keys.append(key)
+        if removed_keys:
+            logger.info(f"Removed fixed position embeddings from {state_name}: {removed_keys}")
+
+    @staticmethod
+    def _load_model_from_safetensors_artifact(target_model, artifact_path, logger, state_name):
+        model_keys = set(target_model.state_dict().keys())
+        ignored_missing_keys = {
+            key for key in FSDPCheckpoint.FIXED_POS_EMBED_KEYS if key in model_keys
+        }
+        loaded_keys = set()
+        unexpected_keys = set()
+
+        if artifact_path.endswith(".index.json"):
+            shard_paths = list(FSDPCheckpoint._iter_shard_paths(artifact_path))
+            logger.info(
+                f"Loading sharded {state_name} from {artifact_path} ({len(shard_paths)} shards)."
+            )
+        else:
+            shard_paths = [(os.path.basename(artifact_path), artifact_path)]
+            logger.info(f"Loading {state_name} from {artifact_path}.")
+
+        for shard_name, shard_path in shard_paths:
+            shard_state_dict = load_file(shard_path, device="cpu")
+            FSDPCheckpoint._remove_fixed_pos_embeds(shard_state_dict, logger, state_name)
+
+            shard_keys = set(shard_state_dict.keys())
+            loaded_keys.update(shard_keys & model_keys)
+            unexpected_keys.update(shard_keys - model_keys)
+
+            incompatible_keys = target_model.load_state_dict(shard_state_dict, strict=False)
+            unexpected_keys.update(incompatible_keys.unexpected_keys)
+            logger.info(
+                f"Loaded {len(shard_state_dict)} tensors from {shard_name} into {state_name}."
+            )
+            del shard_state_dict
+
+        missing_keys = sorted(model_keys - loaded_keys - ignored_missing_keys)
+        if missing_keys or unexpected_keys:
+            logger.info(
+                f"{state_name} load summary: loaded={len(loaded_keys)}, "
+                f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}"
+            )
+            if missing_keys:
+                logger.info(f"{state_name} missing keys (first 20): {missing_keys[:20]}")
+            if unexpected_keys:
+                logger.info(
+                    f"{state_name} unexpected keys (first 20): {sorted(unexpected_keys)[:20]}"
+                )
+        else:
+            logger.info(f"{state_name} load summary: loaded all {len(loaded_keys)} tensors.")
+
     @staticmethod
     def fsdp_save_ckpt(
         ckpt_dir, 
@@ -156,44 +250,25 @@ class FSDPCheckpoint:
     def try_load_ckpt(resume_from, logger, model, ema_model=None, resume_from_ema=False):
         if resume_from is not None and os.path.exists(resume_from):
             logger.info(f"Loading checkpoint from {resume_from}.")
-            if resume_from_ema:
-                model_state_dict_path = os.path.join(resume_from, f"ema.safetensors")
-            else:
-                model_state_dict_path = os.path.join(resume_from, f"model.safetensors")
-            model_state_dict = load_file(model_state_dict_path, device="cpu")
-            # NOTE position embeds are fixed sinusoidal embeddings, so we can just pop it off,
-            # which makes it easier to adapt to different resolutions.
-            # model_state_dict.pop('latent_pos_embed.pos_embed')
-            # model_state_dict.pop('vit_pos_embed.pos_embed')
-            for key in ['latent_pos_embed.pos_embed', 'vit_pos_embed.pos_embed']:
-                if key in model_state_dict:
-                    model_state_dict.pop(key)
-                    print(f"Removed {key} from model_state_dict")
-                else:
-                    print(f"{key} not found in model_state_dict, skipping")
-            msg = model.load_state_dict(model_state_dict, strict=False)
-            logger.info(msg)
-            del model_state_dict
+            model_stem = "ema" if resume_from_ema else "model"
+            model_artifact_path = FSDPCheckpoint._find_safetensors_artifact(resume_from, model_stem)
+            if model_artifact_path is None:
+                raise FileNotFoundError(
+                    f"Could not find {model_stem}.safetensors or "
+                    f"{model_stem}.safetensors.index.json under {resume_from}"
+                )
+            FSDPCheckpoint._load_model_from_safetensors_artifact(
+                model, model_artifact_path, logger, state_name="model"
+            )
 
             if ema_model is not None:
-                ema_state_dict_path = os.path.join(resume_from, f"ema.safetensors")
-                if not os.path.exists(ema_state_dict_path):
-                    logger.info(f"replicaing ema model from {model_state_dict_path}.")
-                    ema_state_dict_path = model_state_dict_path
-                ema_state_dict = load_file(ema_state_dict_path, device="cpu")
-                # NOTE position embeds are fixed sinusoidal embeddings, so we can just pop it off,
-                # which makes it easier to adapt to different resolutions.
-                # ema_state_dict.pop('latent_pos_embed.pos_embed')
-                # ema_state_dict.pop('vit_pos_embed.pos_embed')
-                for key in ['latent_pos_embed.pos_embed', 'vit_pos_embed.pos_embed']:
-                    if key in ema_state_dict:
-                        ema_state_dict.pop(key)
-                        print(f"Removed {key} from ema_state_dict")
-                    else:
-                        print(f"{key} not found in ema_state_dict, skipping")
-                msg = ema_model.load_state_dict(ema_state_dict, strict=False)
-                logger.info(msg)
-                del ema_state_dict
+                ema_artifact_path = FSDPCheckpoint._find_safetensors_artifact(resume_from, "ema")
+                if ema_artifact_path is None:
+                    logger.info(f"Replicating ema model from {model_artifact_path}.")
+                    ema_artifact_path = model_artifact_path
+                FSDPCheckpoint._load_model_from_safetensors_artifact(
+                    ema_model, ema_artifact_path, logger, state_name="ema_model"
+                )
         else:
             logger.info(f"Training from scratch.")
         return model, ema_model

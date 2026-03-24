@@ -63,6 +63,77 @@ After downloading, place the checkpoint in a local directory. The inference pipe
 
 If `ema.safetensors.index.json` is missing, model loading will fail at initialization time.
 
+## Finetuning
+
+The repository includes a finetuning launcher, [`scripts/train.sh`](./scripts/train.sh), with local path placeholders that you can replace on your machine.
+
+### 1. Download the released model locally
+
+Download the model from:
+
+- [GSAI-ML/LLaDA-o](https://huggingface.co/GSAI-ML/LLaDA-o)
+
+Then point both `MODEL_PATH` and `RESUME_FROM` in [`scripts/train.sh`](./scripts/train.sh) to that local directory for the first finetuning run. The script uses:
+
+- `--finetune_from_hf True`
+- `--resume_model_only True`
+- `--finetune_from_ema True`
+
+So the local Hugging Face model directory is used as the configuration/tokenizer/VAE source as well as the initial EMA checkpoint source.
+
+### 2. Download the example datasets locally
+
+The default example config [`data/configs/example.yaml`](./data/configs/example.yaml) expects two datasets:
+
+- [jackyhate/text-to-image-2M](https://huggingface.co/datasets/jackyhate/text-to-image-2M)
+- [Open-Bee/Honey-Data-15M](https://huggingface.co/datasets/Open-Bee/Honey-Data-15M)
+
+[`data/dataset_info.py`](./data/dataset_info.py) now points to local Hugging Face download directories via environment variables:
+
+- `LLADAO_DATA_ROOT`
+- `LLADAO_T2I_2M_DIR`
+- `LLADAO_VLM_BEE_DIR`
+
+If you do not set them, the code falls back to these placeholder local paths:
+
+```text
+/path/to/local/huggingface_datasets/text-to-image-2M
+/path/to/local/huggingface_datasets/Honey-Data-15M
+```
+
+Replace those paths with the directories where you store the downloaded datasets, or export the environment variables before launching training.
+
+### 3. Set your training output directories
+
+In [`scripts/train.sh`](./scripts/train.sh), set these paths to locations on your machine:
+
+- `RESULTS_DIR`
+- `CHECKPOINT_DIR`
+- `WANDB_LOG_DIR`
+
+### 4. Launch finetuning
+
+From the repository root:
+
+```bash
+bash scripts/train.sh 1 8
+```
+
+Or override paths from the shell:
+
+```bash
+MODEL_PATH=/path/to/local/GSAI-ML-LLaDA-o \
+RESUME_FROM=/path/to/local/GSAI-ML-LLaDA-o \
+RESULTS_DIR=/path/to/your/finetune_run \
+CHECKPOINT_DIR=/path/to/your/finetune_run/checkpoints \
+WANDB_LOG_DIR=/path/to/your/finetune_run \
+LLADAO_T2I_2M_DIR=/path/to/local/text-to-image-2M \
+LLADAO_VLM_BEE_DIR=/path/to/local/Honey-Data-15M \
+bash scripts/train.sh 1 8
+```
+
+On later restarts, `--auto_resume True` lets the trainer prefer the latest checkpoint already written under `CHECKPOINT_DIR`.
+
 ## Inference with `multimodal_demo.ipynb`
 
 The recommended way to run inference in this repository is through [`multimodal_demo.ipynb`](./multimodal_demo.ipynb). The notebook provides a unified and reproducible workflow for the main multimodal capabilities currently exposed by the codebase.
